@@ -1,6 +1,7 @@
 # 💎 Finance AI — Smart Financial Document Analyzer
 
 An AI-powered web app that reads your invoices, bank statements, and receipts — and turns them into professional financial analytics in seconds.
+live demo https://finance-ai-7mb5r63rwyyb2z8fczof6w.streamlit.app/
 
 > Built with Google Gemini · Streamlit · PostgreSQL
 
