@@ -1,65 +1,103 @@
 """
-AI Document Parser using Google Gemini
-Supports invoices, bank statements, receipts, and CSV files
-✨ NEW: Real PDF OCR + Multi-currency conversion
+AI Document Parser
+✨ Uses Groq API (free, fast) with fallback to Google Gemini
+Supports: images, PDFs (OCR), CSV files + multi-currency
 """
 import os
 import json
+import base64
 import requests
 import pandas as pd
-import google.generativeai as genai
 from PIL import Image
 from dotenv import load_dotenv
-from io import StringIO
+from io import StringIO, BytesIO
 
 load_dotenv()
 
-def _get_api_key():
-    """Read API key from .env locally OR from Streamlit secrets on Cloud."""
-    # 1. Try environment variable first (.env file / system env)
-    key = os.getenv("GEMINI_API_KEY")
-    if key:
-        return key
-    # 2. Try Streamlit secrets (Streamlit Cloud deployment)
+
+# ─────────────────────────────────────────────
+# API Key helpers — read from .env OR st.secrets
+# ─────────────────────────────────────────────
+def _get_secret(name: str) -> str | None:
+    val = os.getenv(name)
+    if val:
+        return val
     try:
         import streamlit as st
-        key = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("gemini_api_key")
-        if key:
-            return key
+        val = st.secrets.get(name) or st.secrets.get(name.lower())
+        if val:
+            return val
     except Exception:
         pass
     return None
 
-_api_key = _get_api_key()
-if not _api_key:
+
+GROQ_API_KEY   = _get_secret("GROQ_API_KEY")
+GEMINI_API_KEY = _get_secret("GEMINI_API_KEY")
+
+if not GROQ_API_KEY and not GEMINI_API_KEY:
     raise RuntimeError(
-        "GEMINI_API_KEY not found.\n"
-        "• Locally: add GEMINI_API_KEY=AIza... to your .env file\n"
-        "• Streamlit Cloud: go to Settings → Secrets and add:\n"
-        "  GEMINI_API_KEY = \"AIza...\""
+        "No AI API key found.\n"
+        "Add GROQ_API_KEY (free at console.groq.com) to Streamlit secrets.\n"
+        "Or add GEMINI_API_KEY as a fallback."
     )
-genai.configure(api_key=_api_key)
 
-# Try models in order — handles regional availability differences
-_MODEL_CANDIDATES = [
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-latest",
-    "gemini-1.0-pro",
-]
 
-# Instantiate model — no probing, GenerativeModel() itself never raises
-model = genai.GenerativeModel(_MODEL_CANDIDATES[0])
+# ─────────────────────────────────────────────
+# Groq client (text only — free & fast)
+# ─────────────────────────────────────────────
+GROQ_MODEL = "llama-3.3-70b-versatile"   # free, very capable
+GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
 
-EXTRACTION_PROMPT = """
-You are a financial document analyzer. Analyze this document (invoice, bank statement, receipt, or transaction list) and extract ALL transactions.
 
-Return ONLY a valid JSON object with this exact structure:
+def _groq_text(prompt: str) -> str:
+    """Call Groq API with a text prompt."""
+    resp = requests.post(
+        GROQ_URL,
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        json={"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+# ─────────────────────────────────────────────
+# Gemini client (vision — for images)
+# ─────────────────────────────────────────────
+_gemini_model = None
+
+def _get_gemini():
+    global _gemini_model
+    if _gemini_model:
+        return _gemini_model
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "Image analysis requires GEMINI_API_KEY.\n"
+            "Get a free key at aistudio.google.com (free tier: 15 requests/min).\n"
+            "Add it to Streamlit secrets as GEMINI_API_KEY."
+        )
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    for name in ["gemini-1.5-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash-latest"]:
+        try:
+            _gemini_model = genai.GenerativeModel(name)
+            return _gemini_model
+        except Exception:
+            continue
+    raise RuntimeError("Could not initialize Gemini model.")
+
+
+# ─────────────────────────────────────────────
+# Prompts
+# ─────────────────────────────────────────────
+EXTRACTION_PROMPT = """You are a financial document analyzer. Extract ALL transactions from this document.
+
+Return ONLY a valid JSON object — no markdown, no explanation:
 {
   "doc_type": "invoice|bank_statement|receipt|csv",
   "currency": "SEK|USD|EUR|etc",
-  "summary": "brief description of the document",
+  "summary": "brief description",
   "transactions": [
     {
       "date": "YYYY-MM-DD",
@@ -72,218 +110,169 @@ Return ONLY a valid JSON object with this exact structure:
 }
 
 Rules:
-- Extract every single transaction you can find
 - Amounts must be positive numbers
-- Use "income" for money received, "expense" for money spent
-- If date is missing use today's date
-- Categories must be one of: Food, Transport, Shopping, Health, Education, Entertainment, Housing, Salary, Other
-- Return ONLY the JSON, no other text
-"""
+- Use income for money received, expense for money spent
+- If date is missing use today
+- Return ONLY the JSON"""
+
+
+def _clean_json(raw: str) -> dict:
+    raw = raw.strip()
+    if "```" in raw:
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip().rstrip("`").strip()
+    return json.loads(raw)
 
 
 # ─────────────────────────────────────────────
-# ✨ NEW: Multi-currency conversion
+# ✨ Public parse functions
+# ─────────────────────────────────────────────
+def parse_document(image: Image.Image) -> dict:
+    """Parse image using Gemini Vision (requires GEMINI_API_KEY)."""
+    model = _get_gemini()
+    response = model.generate_content([EXTRACTION_PROMPT, image])
+    return _clean_json(response.text)
+
+
+def parse_text_document(text: str) -> dict:
+    """Parse text (from PDF/OCR) using Groq (free) or Gemini fallback."""
+    prompt = f"{EXTRACTION_PROMPT}\n\nDocument text:\n{text[:4000]}"
+    if GROQ_API_KEY:
+        return _clean_json(_groq_text(prompt))
+    model = _get_gemini()
+    return _clean_json(model.generate_content(prompt).text)
+
+
+def parse_pdf_file(file_bytes: bytes) -> dict:
+    """Parse PDF: OCR → text → Groq. Falls back to Gemini vision."""
+    try:
+        from pdf2image import convert_from_bytes
+        import pytesseract
+        images = convert_from_bytes(file_bytes, dpi=300)
+        full_text = "\n".join(pytesseract.image_to_string(img, lang="eng") for img in images)
+        if len(full_text.strip()) > 50:
+            return parse_text_document(full_text)
+        # OCR got nothing — try Gemini Vision on first page
+        return parse_document(images[0])
+    except ImportError:
+        return parse_text_document("PDF document — extract financial transactions if any.")
+    except Exception as e:
+        raise Exception(f"PDF parsing error: {e}")
+
+
+def parse_csv_file(file_content: str) -> dict:
+    """Auto-detect CSV columns or fall back to AI parsing."""
+    try:
+        df = pd.read_csv(StringIO(file_content))
+        df.columns = df.columns.str.strip().str.lower()
+        date_col   = next((c for c in df.columns if any(k in c for k in ["date","datum","fecha"])), None)
+        desc_col   = next((c for c in df.columns if any(k in c for k in ["desc","detail","merchant","payee","beskrivning"])), None)
+        amount_col = next((c for c in df.columns if any(k in c for k in ["amount","value","sum","belopp","cantidad"])), None)
+        type_col   = next((c for c in df.columns if any(k in c for k in ["type","typ"])), None)
+        cat_col    = next((c for c in df.columns if any(k in c for k in ["category","kategori"])), None)
+
+        if not date_col or not amount_col:
+            return _parse_csv_with_ai(file_content)
+
+        transactions = []
+        for _, row in df.iterrows():
+            try:
+                amount = float(str(row[amount_col]).replace(",", ".").replace(" ", ""))
+                if type_col:
+                    tx_type = "expense" if any(k in str(row[type_col]).lower() for k in ["expense","debit","debet"]) else "income"
+                else:
+                    tx_type = "expense" if amount < 0 else "income"
+                transactions.append({
+                    "date": str(row[date_col]),
+                    "description": str(row[desc_col]) if desc_col else "Transaction",
+                    "amount": abs(amount),
+                    "category": str(row[cat_col]) if cat_col else "Other",
+                    "type": tx_type,
+                })
+            except Exception:
+                continue
+        return {"doc_type": "csv", "currency": "SEK", "summary": f"CSV with {len(transactions)} transactions", "transactions": transactions}
+    except Exception:
+        return _parse_csv_with_ai(file_content)
+
+
+def _parse_csv_with_ai(csv_content: str) -> dict:
+    prompt = f"{EXTRACTION_PROMPT}\n\nCSV file:\n{csv_content[:3000]}"
+    if GROQ_API_KEY:
+        return _clean_json(_groq_text(prompt))
+    model = _get_gemini()
+    return _clean_json(model.generate_content(prompt).text)
+
+
+# ─────────────────────────────────────────────
+# ✨ Multi-currency
 # ─────────────────────────────────────────────
 _fx_cache: dict = {}
 
 def get_exchange_rate(from_currency: str, to_currency: str = "SEK") -> float:
-    """Fetch live exchange rate. Cached per session."""
     if from_currency == to_currency:
         return 1.0
-    cache_key = f"{from_currency}_{to_currency}"
-    if cache_key in _fx_cache:
-        return _fx_cache[cache_key]
+    key = f"{from_currency}_{to_currency}"
+    if key in _fx_cache:
+        return _fx_cache[key]
     try:
-        r = requests.get(
-            f"https://api.frankfurter.app/latest?from={from_currency}&to={to_currency}",
-            timeout=5
-        )
+        r = requests.get(f"https://api.frankfurter.app/latest?from={from_currency}&to={to_currency}", timeout=5)
         rate = r.json()["rates"][to_currency]
-        _fx_cache[cache_key] = rate
+        _fx_cache[key] = rate
         return rate
     except Exception:
-        # Fallback rates if API is down
         fallback = {"USD": 10.5, "EUR": 11.2, "GBP": 13.1, "NOK": 0.95, "DKK": 1.5}
         return fallback.get(from_currency, 1.0)
 
 
 def convert_transactions_to_sek(transactions: list, source_currency: str) -> list:
-    """Convert all transaction amounts to SEK."""
     if source_currency == "SEK":
         return transactions
     rate = get_exchange_rate(source_currency, "SEK")
-    converted = []
+    result = []
     for tx in transactions:
         tx = tx.copy()
-        original_amount = tx.get("amount", 0)
-        tx["amount"] = round(float(original_amount) * rate, 2)
-        tx["original_amount"] = original_amount
+        tx["original_amount"]   = tx.get("amount", 0)
         tx["original_currency"] = source_currency
-        converted.append(tx)
-    return converted
+        tx["amount"] = round(float(tx["amount"]) * rate, 2)
+        result.append(tx)
+    return result
 
 
 # ─────────────────────────────────────────────
-# ✨ NEW: Real PDF parsing with OCR
-# ─────────────────────────────────────────────
-def parse_pdf_file(file_bytes: bytes) -> dict:
-    """
-    Parse PDF using pdf2image + pytesseract OCR.
-    Falls back to Gemini vision on each page image.
-    """
-    try:
-        from pdf2image import convert_from_bytes
-        import pytesseract
-
-        # Convert PDF pages to images
-        images = convert_from_bytes(file_bytes, dpi=300)
-
-        # Try OCR text first
-        full_text = ""
-        for img in images:
-            page_text = pytesseract.image_to_string(img, lang="eng")
-            full_text += page_text + "\n"
-
-        if len(full_text.strip()) > 50:
-            # Good OCR result — use text parser
-            return parse_text_document(full_text)
-        else:
-            # OCR failed (scanned image) — send pages to Gemini vision
-            results = []
-            for img in images[:3]:  # Max 3 pages
-                try:
-                    result = parse_document(img)
-                    results.append(result)
-                except Exception:
-                    continue
-
-            if not results:
-                raise ValueError("Could not extract text from PDF")
-
-            # Merge results from all pages
-            merged = results[0]
-            for r in results[1:]:
-                merged["transactions"].extend(r.get("transactions", []))
-            merged["summary"] = f"PDF with {len(merged['transactions'])} transactions across {len(images)} pages"
-            return merged
-
-    except ImportError:
-        # pdf2image not available — try direct text extraction
-        return parse_text_document(f"PDF document uploaded. Please analyze any financial data.")
-    except Exception as e:
-        raise Exception(f"PDF parsing error: {e}")
-
-
-# ─────────────────────────────────────────────
-# Core parsers
-# ─────────────────────────────────────────────
-def parse_document(image: Image.Image) -> dict:
-    """Send image to Gemini and extract transactions."""
-    response = model.generate_content([EXTRACTION_PROMPT, image])
-    return _clean_and_parse(response.text)
-
-
-def parse_text_document(text: str) -> dict:
-    """Parse extracted text (from PDF/OCR) using Gemini."""
-    prompt = f"{EXTRACTION_PROMPT}\n\nDocument text:\n{text}"
-    response = model.generate_content(prompt)
-    return _clean_and_parse(response.text)
-
-
-def _clean_and_parse(raw: str) -> dict:
-    """Clean markdown fences and parse JSON."""
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw.strip())
-
-
-# ─────────────────────────────────────────────
-# CSV parsing
-# ─────────────────────────────────────────────
-def parse_csv_file(file_content: str) -> dict:
-    """Parse CSV file with auto-detection or AI fallback."""
-    try:
-        df = pd.read_csv(StringIO(file_content))
-        date_cols = ['date', 'transaction_date', 'posting_date', 'datum', 'fecha']
-        desc_cols = ['description', 'details', 'merchant', 'payee', 'beskrivning', 'descripción']
-        amount_cols = ['amount', 'value', 'sum', 'belopp', 'cantidad']
-        type_cols = ['type', 'transaction_type', 'typ']
-        category_cols = ['category', 'kategori', 'categoría']
-
-        df.columns = df.columns.str.strip().str.lower()
-        date_col = next((col for col in df.columns if any(d in col for d in date_cols)), None)
-        desc_col = next((col for col in df.columns if any(d in col for d in desc_cols)), None)
-        amount_col = next((col for col in df.columns if any(d in col for d in amount_cols)), None)
-        type_col = next((col for col in df.columns if any(t in col for t in type_cols)), None)
-        category_col = next((col for col in df.columns if any(c in col for c in category_cols)), None)
-
-        if not date_col or not amount_col:
-            return parse_csv_with_ai(file_content)
-
-        transactions = []
-        for _, row in df.iterrows():
-            try:
-                amount = float(str(row[amount_col]).replace(',', '.').replace(' ', ''))
-                if type_col and type_col in row:
-                    tx_type = 'expense' if 'expense' in str(row[type_col]).lower() or 'debit' in str(row[type_col]).lower() else 'income'
-                else:
-                    tx_type = 'expense' if amount < 0 else 'income'
-                transactions.append({
-                    "date": str(row[date_col]) if date_col else "",
-                    "description": str(row[desc_col]) if desc_col else "Transaction",
-                    "amount": abs(amount),
-                    "category": str(row[category_col]) if category_col and category_col in row else "Other",
-                    "type": tx_type
-                })
-            except Exception:
-                continue
-
-        return {
-            "doc_type": "csv",
-            "currency": "SEK",
-            "summary": f"CSV file with {len(transactions)} transactions",
-            "transactions": transactions
-        }
-    except Exception:
-        return parse_csv_with_ai(file_content)
-
-
-def parse_csv_with_ai(csv_content: str) -> dict:
-    """Use Gemini AI to parse CSV when auto-detection fails."""
-    prompt = f"{EXTRACTION_PROMPT}\n\nThis is a CSV file:\n{csv_content[:3000]}"
-    response = model.generate_content(prompt)
-    return _clean_and_parse(response.text)
-
-
-# ─────────────────────────────────────────────
-# ✨ NEW: AI Financial Chat
+# ✨ AI Chat
 # ─────────────────────────────────────────────
 def chat_with_finances(user_message: str, financial_context: str, history: list) -> str:
-    """
-    Chat with Gemini about personal finances.
-    history: list of (role, message) tuples
-    """
-    system_prompt = f"""You are a smart and friendly personal finance advisor.
-You have access to the user's real financial data below. Answer questions clearly and helpfully.
-Always give specific numbers from the data when relevant.
-If asked in Arabic, respond in Arabic. If in English, respond in English.
+    system = f"""You are a smart personal finance advisor.
+You have access to the user's real financial data. Answer clearly and helpfully with specific numbers.
+If the user writes in Arabic, respond in Arabic. If English, respond in English.
 
 FINANCIAL DATA:
-{financial_context}
-"""
-    # Build conversation history
-    messages = [system_prompt]
-    for role, msg in history[-6:]:  # Last 6 exchanges for context
-        prefix = "User" if role == "user" else "Assistant"
-        messages.append(f"{prefix}: {msg}")
-    messages.append(f"User: {user_message}")
+{financial_context}"""
 
-    full_prompt = "\n\n".join(messages)
-    response = model.generate_content(full_prompt)
-    return response.text
+    if GROQ_API_KEY:
+        messages = [{"role": "system", "content": system}]
+        for role, msg in history[-6:]:
+            messages.append({"role": "user" if role == "user" else "assistant", "content": msg})
+        messages.append({"role": "user", "content": user_message})
+        resp = requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={"model": GROQ_MODEL, "messages": messages, "temperature": 0.7},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    # Fallback to Gemini
+    model = _get_gemini()
+    parts = [system]
+    for role, msg in history[-6:]:
+        parts.append(f"{'User' if role == 'user' else 'Assistant'}: {msg}")
+    parts.append(f"User: {user_message}")
+    return model.generate_content("\n\n".join(parts)).text
 
 
 # ─────────────────────────────────────────────
