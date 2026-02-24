@@ -58,6 +58,11 @@ section[data-testid="stSidebar"] { background: #0d1117 !important; border-right:
     background: linear-gradient(135deg, rgba(251,191,36,0.1), rgba(239,68,68,0.08));
     border: 1px solid rgba(251,191,36,0.3); border-radius: 12px; padding: 14px 18px; margin: 6px 0;
 }
+.success-banner {
+    background: linear-gradient(135deg, rgba(52,211,153,0.15), rgba(16,185,129,0.08));
+    border: 1px solid rgba(52,211,153,0.4); border-radius: 12px; padding: 16px 20px; margin: 8px 0;
+    text-align: center; font-weight: 600; color: #34d399;
+}
 .tx-row {
     background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
     border-radius: 10px; padding: 12px 16px; margin: 4px 0;
@@ -73,6 +78,9 @@ section[data-testid="stSidebar"] { background: #0d1117 !important; border-right:
     color: white !important; border: none !important; border-radius: 10px !important;
     padding: 10px 24px !important; font-weight: 700 !important; width: 100% !important;
     font-size: 0.95rem !important;
+}
+.save-btn > button {
+    background: linear-gradient(135deg, #059669, #10b981) !important;
 }
 h1, h2, h3 { color: #e2e8f0 !important; }
 .stTabs [data-baseweb="tab-list"] { background: rgba(255,255,255,0.03); border-radius: 12px; padding: 4px; }
@@ -92,6 +100,15 @@ def setup_db():
         return None
 
 engine = setup_db()
+
+# ── Session State Init ─────────────────────────────────────────
+# 🔧 FIX: Initialize session state to persist parsed data between button clicks
+if "parsed_result" not in st.session_state:
+    st.session_state.parsed_result = None
+if "uploaded_filename" not in st.session_state:
+    st.session_state.uploaded_filename = None
+if "save_success" not in st.session_state:
+    st.session_state.save_success = False
 
 # ── Helpers ────────────────────────────────────────────────────
 def save_document(engine, filename, doc_type, summary):
@@ -160,7 +177,7 @@ with st.sidebar:
     st.markdown("## 💎 Finance AI")
     st.markdown("*Smart Financial Analyzer*")
     st.markdown("---")
-    page = st.radio("", ["🏠 Dashboard", "📄 Upload Document", "💳 Transactions", "📊 Analytics", "🎯 Budget"], label_visibility="collapsed")
+    page = st.radio("", ["🏠 Dashboard", "📄 Upload Document", "💳 Transactions", "📊 Analytics", "🎯 Budget", "⚙️ Manage Data"], label_visibility="collapsed")
     st.markdown("---")
     df_all = get_all_transactions(engine) if engine else pd.DataFrame()
     total_in = df_all[df_all["transaction_type"] == "income"]["amount"].sum() if not df_all.empty else 0
@@ -229,18 +246,25 @@ if page == "🏠 Dashboard":
 elif page == "📄 Upload Document":
     st.markdown("# 📄 Upload Financial Document")
     st.markdown("*Upload invoices, bank statements, receipts, or CSV files — Gemini AI reads them and extracts transactions automatically*")
+    
     uploaded = st.file_uploader("Drag and drop file here", type=["png","jpg","jpeg","webp","pdf","csv"])
+    
+    # 🔧 FIX: Clear session state when a new file is uploaded
+    if uploaded and uploaded.name != st.session_state.uploaded_filename:
+        st.session_state.parsed_result = None
+        st.session_state.uploaded_filename = uploaded.name
+        st.session_state.save_success = False
+
     if uploaded:
         col1, col2 = st.columns(2)
         with col1:
             st.markdown('<div class="section-title">📎 Document</div>', unsafe_allow_html=True)
             if uploaded.type == "text/csv":
                 st.success(f"📊 CSV File: {uploaded.name}")
-                # Show preview of CSV
                 try:
                     csv_preview = pd.read_csv(uploaded)
                     st.dataframe(csv_preview.head(5), use_container_width=True)
-                    uploaded.seek(0)  # Reset file pointer
+                    uploaded.seek(0)
                 except:
                     pass
             elif uploaded.type == "application/pdf":
@@ -250,10 +274,13 @@ elif page == "📄 Upload Document":
         
         with col2:
             st.markdown('<div class="section-title">🤖 AI Analysis</div>', unsafe_allow_html=True)
+            
+            # ── Step 1: Analyze Button ─────────────────────────────
             if st.button("🚀 Analyze Document Now"):
+                st.session_state.save_success = False
                 with st.spinner("🧠 Gemini AI is reading the document..."):
                     try:
-                        # Handle different file types
+                        uploaded.seek(0)
                         if uploaded.type == "text/csv":
                             csv_content = uploaded.read().decode('utf-8')
                             parsed = parse_csv_file(csv_content)
@@ -262,29 +289,53 @@ elif page == "📄 Upload Document":
                         else:
                             parsed = parse_document(Image.open(uploaded))
                         
-                        transactions = parsed.get("transactions", [])
-                        summary = parsed.get("summary", "")
-                        doc_type = parsed.get("doc_type", "document")
-                        currency = parsed.get("currency", "SEK")
-                        
-                        if transactions:
-                            st.success(f"✅ Extracted **{len(transactions)} transactions**!")
-                            st.markdown(f'<div class="insight-card">📝 {summary}</div>', unsafe_allow_html=True)
-                            preview = pd.DataFrame(transactions)
-                            st.dataframe(preview[["date","description","amount","category","type"]], use_container_width=True,
-                                        column_config={"date":"Date","description":"Description",
-                                                      "amount":st.column_config.NumberColumn("Amount",format="%.2f"),
-                                                      "category":"Category","type":"Type"})
-                            if st.button("💾 Save to Database"):
-                                doc_id = save_document(engine, uploaded.name, doc_type, summary)
-                                save_transactions(engine, doc_id, transactions, currency)
-                                st.success("🎉 Saved! Go to Dashboard to see results.")
-                                st.balloons()
-                        else:
-                            st.warning("No transactions extracted. Try a clearer image or CSV.")
+                        # 🔧 FIX: Store parsed result in session state so it persists
+                        st.session_state.parsed_result = parsed
                     except Exception as e:
                         st.error(f"❌ Error: {e}")
                         st.info("Make sure GEMINI_API_KEY is set in .env or Streamlit secrets")
+            
+            # ── Step 2: Show Results (from session state) ──────────
+            # 🔧 FIX: Render results from session_state, NOT from inside button click
+            if st.session_state.parsed_result:
+                parsed = st.session_state.parsed_result
+                transactions = parsed.get("transactions", [])
+                summary = parsed.get("summary", "")
+                doc_type = parsed.get("doc_type", "document")
+                currency = parsed.get("currency", "SEK")
+                
+                if transactions:
+                    st.success(f"✅ Extracted **{len(transactions)} transactions**!")
+                    st.markdown(f'<div class="insight-card">📝 {summary}</div>', unsafe_allow_html=True)
+                    preview = pd.DataFrame(transactions)
+                    st.dataframe(preview[["date","description","amount","category","type"]], use_container_width=True,
+                                column_config={"date":"Date","description":"Description",
+                                              "amount":st.column_config.NumberColumn("Amount",format="%.2f"),
+                                              "category":"Category","type":"Type"})
+                    
+                    # ── Step 3: Save Button ────────────────────────────
+                    # 🔧 FIX: Save button is OUTSIDE the analyze button block — no nesting
+                    if not st.session_state.save_success:
+                        st.markdown('<div class="save-btn">', unsafe_allow_html=True)
+                        if st.button("💾 Save to Database"):
+                            try:
+                                doc_id = save_document(engine, uploaded.name, doc_type, summary)
+                                save_transactions(engine, doc_id, transactions, currency)
+                                st.session_state.save_success = True
+                                st.session_state.parsed_result = None  # Clear after saving
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Save failed: {e}")
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    
+                else:
+                    st.warning("No transactions extracted. Try a clearer image or CSV.")
+            
+            # ── Show success message after save ────────────────────
+            if st.session_state.save_success:
+                st.markdown('<div class="success-banner">🎉 Saved successfully! Go to Dashboard to see your data.</div>', unsafe_allow_html=True)
+                st.balloons()
+                st.session_state.save_success = False
 
 # ═══ TRANSACTIONS ═══
 elif page == "💳 Transactions":
@@ -293,15 +344,33 @@ elif page == "💳 Transactions":
     if df.empty:
         st.info("Upload documents first!")
     else:
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             tx_type = st.selectbox("Type", ["All","expense","income"])
         with col2:
             cat_filter = st.selectbox("Category", ["All"] + sorted(df["category"].unique().tolist()))
+        with col3:
+            # Date range filter
+            df["transaction_date"] = pd.to_datetime(df["transaction_date"])
+            min_date = df["transaction_date"].min().date()
+            max_date = df["transaction_date"].max().date()
+            date_range = st.date_input("Date Range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
+
         filtered = df.copy()
-        if tx_type != "All": filtered = filtered[filtered["transaction_type"] == tx_type]
-        if cat_filter != "All": filtered = filtered[filtered["category"] == cat_filter]
-        st.markdown(f"*{len(filtered)} transactions*")
+        if tx_type != "All":
+            filtered = filtered[filtered["transaction_type"] == tx_type]
+        if cat_filter != "All":
+            filtered = filtered[filtered["category"] == cat_filter]
+        if len(date_range) == 2:
+            filtered = filtered[
+                (filtered["transaction_date"].dt.date >= date_range[0]) &
+                (filtered["transaction_date"].dt.date <= date_range[1])
+            ]
+
+        # Summary row
+        total_shown = filtered["amount"].sum()
+        st.markdown(f"*{len(filtered)} transactions · Total: **{total_shown:,.0f} SEK***")
+
         for _, row in filtered.iterrows():
             icon = CATEGORY_ICONS.get(row["category"], "📦")
             color = "#34d399" if row["transaction_type"] == "income" else "#f87171"
@@ -310,10 +379,12 @@ elif page == "💳 Transactions":
                 <div style="display:flex;gap:12px;align-items:center">
                     <span style="font-size:1.3rem">{icon}</span>
                     <div><div style="font-weight:600">{str(row['description'])[:55]}</div>
-                    <div style="font-size:0.78rem;color:rgba(255,255,255,0.4)">{row['category']} · {row['transaction_date']}</div></div>
+                    <div style="font-size:0.78rem;color:rgba(255,255,255,0.4)">{row['category']} · {row['transaction_date'].strftime('%Y-%m-%d') if hasattr(row['transaction_date'], 'strftime') else row['transaction_date']}</div></div>
                 </div>
                 <div style="font-weight:800;color:{color};font-size:1.1rem">{sign}{row['amount']:,.0f} SEK</div>
             </div>""", unsafe_allow_html=True)
+        
+        st.markdown("---")
         csv = filtered.to_csv(index=False).encode("utf-8-sig")
         st.download_button("⬇️ Export CSV", csv, "transactions.csv", "text/csv")
 
@@ -356,6 +427,16 @@ elif page == "📊 Analytics":
             fig3.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0", coloraxis_showscale=False, xaxis_title="", yaxis_title="SEK")
             st.plotly_chart(fig3, use_container_width=True)
 
+            # NEW: Monthly trend table
+            st.markdown('<div class="section-title">📋 Monthly Summary Table</div>', unsafe_allow_html=True)
+            df["month"] = df["transaction_date"].dt.to_period("M").astype(str)
+            monthly_pivot = df.groupby(["month","transaction_type"])["amount"].sum().unstack(fill_value=0).reset_index()
+            if "income" in monthly_pivot.columns and "expense" in monthly_pivot.columns:
+                monthly_pivot["net"] = monthly_pivot["income"] - monthly_pivot["expense"]
+                monthly_pivot.columns.name = None
+                st.dataframe(monthly_pivot.rename(columns={"month":"Month","income":"Income (SEK)","expense":"Expenses (SEK)","net":"Net (SEK)"}),
+                            use_container_width=True, hide_index=True)
+
 # ═══ BUDGET ═══
 elif page == "🎯 Budget":
     st.markdown("# 🎯 Monthly Budget Management")
@@ -376,7 +457,6 @@ elif page == "🎯 Budget":
             conn.commit()
         st.success("✅ Budget saved!")
 
-    # Show progress
     df = get_all_transactions(engine) if engine else pd.DataFrame()
     budget_df = get_budgets(engine)
     if not df.empty and not budget_df.empty:
@@ -401,3 +481,54 @@ elif page == "🎯 Budget":
                     <div style="height:10px;width:{pct}%;background:{bar_color};border-radius:8px;transition:width 0.5s"></div>
                 </div>
             </div>""", unsafe_allow_html=True)
+
+# ═══ MANAGE DATA ═══
+elif page == "⚙️ Manage Data":
+    st.markdown("# ⚙️ Manage Data")
+    df = get_all_transactions(engine) if engine else pd.DataFrame()
+    
+    st.markdown('<div class="section-title">📂 Uploaded Documents</div>', unsafe_allow_html=True)
+    try:
+        docs_df = pd.read_sql("SELECT id, filename, doc_type, upload_date, summary FROM documents ORDER BY upload_date DESC", engine)
+        if docs_df.empty:
+            st.info("No documents uploaded yet.")
+        else:
+            for _, doc in docs_df.iterrows():
+                tx_count = len(df[df["document_id"] == doc["id"]]) if not df.empty else 0
+                with st.expander(f"📄 {doc['filename']} — {tx_count} transactions · {str(doc['upload_date'])[:10]}"):
+                    st.write(f"**Type:** {doc['doc_type']}")
+                    st.write(f"**Summary:** {doc['summary']}")
+                    if st.button(f"🗑️ Delete this document", key=f"del_{doc['id']}"):
+                        with engine.connect() as conn:
+                            conn.execute(text("DELETE FROM documents WHERE id = :id"), {"id": int(doc["id"])})
+                            conn.commit()
+                        st.success("Deleted!")
+                        st.rerun()
+    except Exception as e:
+        st.error(f"Error: {e}")
+    
+    st.markdown('<div class="section-title">➕ Add Manual Transaction</div>', unsafe_allow_html=True)
+    with st.form("manual_tx"):
+        c1, c2 = st.columns(2)
+        with c1:
+            m_date = st.date_input("Date", value=date.today())
+            m_desc = st.text_input("Description")
+            m_amount = st.number_input("Amount", min_value=0.0, step=10.0)
+        with c2:
+            m_cat = st.selectbox("Category", list(CATEGORY_ICONS.keys()))
+            m_type = st.selectbox("Type", ["expense", "income"])
+        if st.form_submit_button("➕ Add Transaction"):
+            try:
+                # Use a generic doc_id = 0 or create a "Manual" doc
+                try:
+                    doc_id = save_document(engine, "Manual Entry", "manual", "Manually added transaction")
+                except:
+                    doc_id = 1
+                save_transactions(engine, doc_id, [{
+                    "date": str(m_date), "description": m_desc,
+                    "amount": m_amount, "category": m_cat, "type": m_type
+                }])
+                st.success("✅ Transaction added!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error: {e}")
