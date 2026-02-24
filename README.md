@@ -8,7 +8,7 @@
 pip install -r requirements.txt
 cp .env.example .env
 # أضيفي مفاتيحك في .env
-python utils/database.py   # تهيئة قاعدة البيانات
+python database.py   # تهيئة قاعدة البيانات
 streamlit run app.py
 ```
 
