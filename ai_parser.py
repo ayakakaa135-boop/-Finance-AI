@@ -15,7 +15,27 @@ from io import StringIO
 load_dotenv()
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-1.5-flash")
+
+# Try models in order — handles regional availability differences
+_MODEL_CANDIDATES = [
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-1.0-pro",
+]
+
+def _get_model():
+    for name in _MODEL_CANDIDATES:
+        try:
+            m = genai.GenerativeModel(name)
+            m.generate_content("hi", generation_config={"max_output_tokens": 1})
+            return m
+        except Exception:
+            continue
+    raise RuntimeError("No Gemini model available — check your GEMINI_API_KEY in Streamlit secrets.")
+
+model = _get_model()
 
 EXTRACTION_PROMPT = """
 You are a financial document analyzer. Analyze this document (invoice, bank statement, receipt, or transaction list) and extract ALL transactions.
