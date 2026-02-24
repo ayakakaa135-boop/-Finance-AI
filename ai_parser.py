@@ -26,14 +26,31 @@ _MODEL_CANDIDATES = [
 ]
 
 def _get_model():
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is missing. "
+            "Add it to Streamlit secrets: Settings → Secrets → GEMINI_API_KEY = \"your_key\""
+        )
+    last_error = None
     for name in _MODEL_CANDIDATES:
         try:
             m = genai.GenerativeModel(name)
-            m.generate_content("hi", generation_config={"max_output_tokens": 1})
+            # lightweight probe — no actual content generation
+            m.count_tokens("test")
             return m
-        except Exception:
+        except Exception as e:
+            last_error = e
             continue
-    raise RuntimeError("No Gemini model available — check your GEMINI_API_KEY in Streamlit secrets.")
+    # If count_tokens probe failed for all, still try to return the first model
+    # (some regions block count_tokens but allow generate_content)
+    try:
+        return genai.GenerativeModel(_MODEL_CANDIDATES[0])
+    except Exception:
+        raise RuntimeError(
+            f"Could not initialize any Gemini model. Last error: {last_error}. "
+            "Check your GEMINI_API_KEY in Streamlit secrets."
+        )
 
 model = _get_model()
 
